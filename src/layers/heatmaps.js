@@ -1,0 +1,179 @@
+import {
+  Mesh,
+  MeshLambertMaterial,
+  SphereGeometry
+} from 'three';
+
+const THREE = window.THREE
+  ? window.THREE // Prefer consumption from global THREE, if exists
+  : {
+    Mesh,
+    MeshLambertMaterial,
+    SphereGeometry
+  };
+
+import Kapsule from 'kapsule';
+import accessorFn from 'accessor-fn';
+import { scaleLinear, scaleQuantize } from 'd3-scale';
+import { interpolateTurbo } from 'd3-scale-chromatic';
+import { max } from 'd3-array';
+import { color as d3Color } from 'd3-color';
+import { Tween, Easing } from '@tweenjs/tween.js';
+
+import { emptyObject } from '../utils/gc';
+import ThreeDigest from '../utils/digest';
+import { array2BufferAttr, bufferAttr2Array } from '../utils/three-utils';
+import { applyShaderExtensionToMaterial, setRadiusShaderExtend } from '../utils/shaders.js';
+import { color2ShaderArr } from '../utils/color-utils';
+import { cartesian2Polar, polar2Cartesian } from '../utils/coordTranslate';
+import { computeGeoKde } from '../utils/kde';
+import { GLOBE_RADIUS } from '../constants';
+
+//
+
+const RES_BW_FACTOR = 3.5; // divider of bandwidth to use in geometry resolution
+const MIN_RESOLUTION = 0.1; // degrees
+const NUM_COLORS = 100; // to sample in shader
+
+const defaultColorInterpolator = t => {
+  const c = d3Color(interpolateTurbo(t)); // turbo, inferno
+  c.opacity = Math.cbrt(t);
+  return c.formatRgb();
+};
+
+export default Kapsule({
+  props: {
+    heatmapsData: { default: [] },
+    heatmapPoints: { default: pnts => pnts },
+    heatmapPointLat: { default: d => d[0] },
+    heatmapPointLng: { default: d => d[1] },
+    heatmapPointWeight: { default: 1 },
+    heatmapBandwidth: { default: 2.5 }, // Gaussian kernel bandwidth, in angular degrees
+    heatmapColorFn: { default: () => defaultColorInterpolator },
+    heatmapColorSaturation: { default: 1.5 }, // multiplier for color scale max
+    heatmapBaseAltitude: { default: 0.01 }, // in units of globe radius
+    heatmapTopAltitude: {}, // in units of globe radius
+    heatmapsTransitionDuration: { default: 0, triggerUpdate: false } // ms
+  },
+
+  init(threeObj, state, { tweenGroup }) {
+    // Clear the scene
+    emptyObject(threeObj);
+
+    // Main three object to manipulate
+    state.scene = threeObj;
+
+    state.tweenGroup = tweenGroup;
+
+    state.dataMapper = new ThreeDigest(threeObj, { objBindAttr: '__threeObjHeatmap' })
+      .onCreateObj(() => {
+        const obj = new THREE.Mesh(
+          new THREE.SphereGeometry(GLOBE_RADIUS),
+          applyShaderExtensionToMaterial(
+            new THREE.MeshLambertMaterial({ vertexColors: true, transparent: true }),
+            setRadiusShaderExtend
+          )
+        );
+
+        obj.__globeObjType = 'heatmap'; // Add object type
+        return obj;
+      });
+  },
+
+  update(state) {
+    // Accessors
+    const pointsAccessor = accessorFn(state.heatmapPoints);
+    const latPntAccessor = accessorFn(state.heatmapPointLat);
+    const lngPntAccessor = accessorFn(state.heatmapPointLng);
+    const weightPntAccessor = accessorFn(state.heatmapPointWeight);
+    const bandwidthAccessor = accessorFn(state.heatmapBandwidth);
+    const colorFnAccessor = accessorFn(state.heatmapColorFn);
+    const saturationAccessor = accessorFn(state.heatmapColorSaturation);
+    const baseAltitudeAccessor = accessorFn(state.heatmapBaseAltitude);
+    const topAltitudeAccessor = accessorFn(state.heatmapTopAltitude);
+
+    state.dataMapper
+      .onUpdateObj((obj, d) => {
+        // Accessors
+        const bandwidth = bandwidthAccessor(d);
+        const colorFn = colorFnAccessor(d);
+        const saturation = saturationAccessor(d);
+        const baseAlt = baseAltitudeAccessor(d);
+        const topAlt = topAltitudeAccessor(d);
+        const pnts = pointsAccessor(d).map(pnt => {
+          const lat = latPntAccessor(pnt);
+          const lng = lngPntAccessor(pnt);
+          const { x, y, z } = polar2Cartesian(lat, lng);
+          return {
+            x, y, z,
+            lat, lng,
+            weight: weightPntAccessor(pnt)
+          }
+        });
+
+        // Check resolution
+        const resolution = Math.max(MIN_RESOLUTION, bandwidth / RES_BW_FACTOR);
+        const equatorNumSegments = Math.ceil(360 / (resolution || -1));
+        if (obj.geometry.parameters.widthSegments !== equatorNumSegments) {
+          obj.geometry.dispose();
+          obj.geometry = new THREE.SphereGeometry(GLOBE_RADIUS, equatorNumSegments, equatorNumSegments / 2);
+        }
+
+        // Get vertex polar coordinates
+        const vertexCoords = bufferAttr2Array(obj.geometry.getAttribute('position'));
+        const vertexGeoCoords = vertexCoords.map(([x, y, z]) => {
+          const { lng, lat } = cartesian2Polar({ x, y, z });
+          return [lng, lat];
+        });
+
+        // Compute KDE
+        computeGeoKde(vertexGeoCoords, pnts, {
+          latAccessor: d => d.lat,
+          lngAccessor: d => d.lng,
+          weightAccessor: d => d.weight,
+          bandwidth
+        }).then(kdeVals => {
+          // Animations
+          const colors = [...new Array(NUM_COLORS)].map((_, idx) => color2ShaderArr(colorFn(idx / (NUM_COLORS - 1))));
+          const applyUpdate = td => {
+            const { kdeVals, topAlt, saturation } = obj.__currentTargetD = td;
+            const maxVal = max(kdeVals.map(Math.abs)) || 1e-15;
+
+            // Set vertex colors
+            const colorScale = scaleQuantize([0, maxVal / saturation], colors);
+            obj.geometry.setAttribute('color', array2BufferAttr(kdeVals.map(v => colorScale(Math.abs(v))), 4));
+
+            // Set altitudes
+            const rScale = scaleLinear([0, maxVal], [GLOBE_RADIUS * (1 + baseAlt), GLOBE_RADIUS * (1 + (topAlt || baseAlt))]);
+            obj.geometry.setAttribute('r', array2BufferAttr(kdeVals.map(rScale)));
+          };
+
+          const targetD = { kdeVals, topAlt, saturation };
+          const currentTargetD = obj.__currentTargetD || Object.assign({}, targetD, {
+            kdeVals: kdeVals.map(() => 0),
+            topAlt: !topAlt ? topAlt : baseAlt,
+            saturation: 0.5
+          });
+          // do not interpolate between different length arrays
+          currentTargetD.kdeVals.length !== kdeVals.length && (currentTargetD.kdeVals = kdeVals.slice());
+
+          if (Object.keys(targetD).some(k => currentTargetD[k] !== targetD[k])) {
+            if (!state.heatmapsTransitionDuration || state.heatmapsTransitionDuration < 0) {
+              // set final position
+              applyUpdate(targetD);
+            } else {
+              // animate
+              state.tweenGroup.add(new Tween(currentTargetD)
+                .to(targetD, state.heatmapsTransitionDuration)
+                .easing(Easing.Quadratic.InOut)
+                .onUpdate(applyUpdate)
+                .onComplete(function() { state.tweenGroup.remove(this) })
+                .start()
+              );
+            }
+          }
+        });
+      })
+      .digest(state.heatmapsData);
+  }
+});
